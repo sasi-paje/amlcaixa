@@ -6,7 +6,8 @@ import pymysql
 from pathlib import Path
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(_env_path)
 except ImportError:
     pass
 
@@ -16,11 +17,12 @@ DB_PORT   = int(os.getenv("DB_PORT", "3306"))
 DB_USER   = os.getenv("DB_USER", "")
 DB_PASS   = os.getenv("DB_PASS", "")
 DB_SCHEMA = os.getenv("DB_SCHEMA", "suhab_copy")
-DB_TABLE = "COMPARACAO"
-REQUIRED_COLS = ["CONTRATO", "CPF_MUTUÁRIO", "CPF_COOBRIGADO", "Nome_Arquivo"]
-OUTPUT_CSV = "consolidado.csv"
-OUTPUT_JOIN = "resultado_join.csv"
+DB_TABLE  = "COMPARACAO"
+REQUIRED_COLS = ["CONTRATO", "NOME_MUTUÁRIO", "CPF_MUTUÁRIO", "CPF_COOBRIGADO"]
+OUTPUT_CSV      = "consolidado.csv"
+OUTPUT_JOIN     = "resultado_join.csv"
 OUTPUT_FALTANTES = "resultado_faltantes_join.csv"
+OUTPUT_DIFF15   = "resultado_join_statussuhab_diff15.csv"
 
 # ─── STEP 0: resolve Excel folder ─────────────────────────────────────────────
 def get_excel_folder():
@@ -32,17 +34,16 @@ def get_excel_folder():
     folder = input("\nInforme o caminho da pasta com os arquivos Excel: ").strip()
     return Path(folder)
 
-# Aliases: colunas que devem ser tratadas como equivalentes
+# Aliases: colunas equivalentes mapeadas para nome canônico
 COL_ALIASES = {
-    "CPF_MUTUÁRIO": ["CPF_BENEFICIÁRIO", "CPF_MUTUARIO", "CPF_BENEFICIARIO"],
+    "CPF_MUTUÁRIO":  ["CPF_BENEFICIÁRIO",  "CPF_MUTUARIO",  "CPF_BENEFICIARIO"],
+    "NOME_MUTUÁRIO": ["NOME_BENEFICIÁRIO", "MUTUARIO_PRINCIPAL", "NOME_BENEFICIARIO"],
 }
 
-# ─── STEP 1: load Excel files and add Nome_Arquivo ────────────────────────────
+# ─── STEP 1: load Excel files ─────────────────────────────────────────────────
 def load_excels(folder: Path):
     xlsx_files = list(folder.glob("*.xlsx")) + list(folder.glob("**/*.xlsx"))
-    # deduplicate
     xlsx_files = list({str(p): p for p in xlsx_files}.values())
-    # skip temp lock files created by Excel (~$...)
     xlsx_files = [p for p in xlsx_files if not p.name.startswith("~$")]
 
     if not xlsx_files:
@@ -58,7 +59,6 @@ def load_excels(folder: Path):
         filename = path.name
         try:
             df = pd.read_excel(path, dtype=str)
-            # Apply column aliases so downstream logic sees canonical names
             rename_map = {}
             for canonical, aliases in COL_ALIASES.items():
                 if canonical not in df.columns:
@@ -69,7 +69,6 @@ def load_excels(folder: Path):
                             break
             if rename_map:
                 df = df.rename(columns=rename_map)
-            df["Nome_Arquivo"] = filename
             dataframes[filename] = df
             print(f"  [OK] {filename}  →  {len(df)} linhas, {len(df.columns)} colunas")
         except Exception as e:
@@ -84,7 +83,6 @@ def audit_columns(dataframes: dict):
     print(f"{'='*60}")
 
     col_map = {fname: set(df.columns) for fname, df in dataframes.items()}
-    all_cols = set.union(*col_map.values()) if col_map else set()
     common_cols = set.intersection(*col_map.values()) if col_map else set()
 
     print(f"\nColunas presentes em TODOS os arquivos ({len(common_cols)}):")
@@ -100,45 +98,76 @@ def audit_columns(dataframes: dict):
 
     print(f"\nVerificação das colunas obrigatórias:")
     for col in REQUIRED_COLS:
-        present_in = [f for f, cols in col_map.items() if col in cols]
         missing_in = [f for f, cols in col_map.items() if col not in cols]
         status = "OK" if not missing_in else f"AUSENTE em {len(missing_in)} arquivo(s)"
         print(f"  {'✓' if not missing_in else '✗'} {col:25s} — {status}")
-        if missing_in:
-            for f in missing_in:
-                print(f"       ↳ {f}")
+        for f in missing_in:
+            print(f"       ↳ {f}")
 
-# ─── STEP 3: consolidate CSV ──────────────────────────────────────────────────
+# ─── STEP 3: consolidate CSV (UNION CPF_MUTUÁRIO + CPF_COOBRIGADO) ────────────
 def consolidate_csv(dataframes: dict, output_path: Path):
     print(f"\n{'='*60}")
     print("PASSO 3 — Consolidação em CSV")
     print(f"{'='*60}")
 
     frames = []
-    # Normalize column lookup (strip whitespace)
-    req = REQUIRED_COLS  # ["CONTRATO", "CPF_MUTUÁRIO", "CPF_COOBRIGADO", "Nome_Arquivo"]
+    col_upper_map = lambda df: {c.upper().strip(): c for c in df.columns}
+
+    def get_col(df, col):
+        if col in df.columns:
+            return df[col]
+        up = col_upper_map(df)
+        if col.upper() in up:
+            return df[up[col.upper()]]
+        return pd.Series([""] * len(df), index=df.index)
 
     for fname, df in dataframes.items():
-        # Build mapping: required col → actual col (case-insensitive fallback)
-        col_upper = {c.upper().strip(): c for c in df.columns}
-        row = {}
-        for rc in req:
-            if rc in df.columns:
-                row[rc] = df[rc]
-            elif rc.upper() in col_upper:
-                row[rc] = df[col_upper[rc.upper()]]
-            else:
-                row[rc] = pd.Series([""] * len(df))
-                print(f"  [AVISO] '{rc}' ausente em '{fname}' — preenchido com vazio")
+        contrato     = get_col(df, "CONTRATO")
+        nome_mut     = get_col(df, "NOME_MUTUÁRIO")
+        cpf_mut      = get_col(df, "CPF_MUTUÁRIO")
+        cpf_coob     = get_col(df, "CPF_COOBRIGADO")
 
-        subset = pd.DataFrame(row)
-        frames.append(subset)
+        for col in REQUIRED_COLS:
+            if col not in df.columns and col.upper() not in col_upper_map(df):
+                print(f"  [AVISO] '{col}' ausente em '{fname}' — preenchido com vazio")
+
+        # Parte 1: linhas do CPF_MUTUÁRIO
+        df_mut = pd.DataFrame({
+            "CONTRATO":      contrato.values,
+            "NOME_MUTUÁRIO": nome_mut.values,
+            "CPF":           cpf_mut.values,
+        })
+
+        # Parte 2: linhas do CPF_COOBRIGADO (somente onde não vazio)
+        df_coob = pd.DataFrame({
+            "CONTRATO":      contrato.values,
+            "NOME_MUTUÁRIO": nome_mut.values,
+            "CPF":           cpf_coob.values,
+        })
+        df_coob = df_coob[df_coob["CPF"].notna() & (df_coob["CPF"].str.strip() != "")]
+
+        frames.extend([df_mut, df_coob])
 
     if not frames:
         print("[ERRO] Nenhum dado para consolidar.")
         sys.exit(1)
 
     consolidated = pd.concat(frames, ignore_index=True)
+    consolidated["CPF"] = (
+        consolidated["CPF"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\D", "", regex=True)
+        .str.zfill(11)
+    )
+    before = len(consolidated)
+    consolidated = consolidated.drop_duplicates(subset=["CONTRATO"])
+    consolidated = consolidated.drop_duplicates(subset=["CPF"])
+    removed = before - len(consolidated)
+    if removed:
+        print(f"  [INFO] {removed} linha(s) duplicada(s) removida(s)")
+
     consolidated.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"\n  [OK] {output_path} gerado — {len(consolidated)} linhas totais")
     return consolidated
@@ -158,6 +187,9 @@ def import_to_mysql(df: pd.DataFrame):
             database=DB_SCHEMA,
             charset="utf8mb4",
             autocommit=False,
+            connect_timeout=30,
+            read_timeout=300,
+            write_timeout=300,
         )
     except Exception as e:
         print(f"  [ERRO DE CONEXÃO] Não foi possível conectar ao MySQL: {e}")
@@ -166,29 +198,25 @@ def import_to_mysql(df: pd.DataFrame):
 
     print(f"  [OK] Conectado a {DB_HOST}:{DB_PORT}/{DB_SCHEMA}")
 
-    create_sql = f"""
-    CREATE TABLE IF NOT EXISTS `{DB_TABLE}` (
-        `CONTRATO`        VARCHAR(100),
-        `CPF_MUTUÁRIO`    VARCHAR(20),
-        `CPF_COOBRIGADO`  VARCHAR(20),
-        `Nome_Arquivo`    VARCHAR(255)
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    """
-
     with conn.cursor() as cur:
-        cur.execute(create_sql)
-        cur.execute(f"TRUNCATE TABLE `{DB_TABLE}`")
+        cur.execute(f"DROP TABLE IF EXISTS `{DB_TABLE}`")
+        cur.execute(f"""
+            CREATE TABLE `{DB_TABLE}` (
+                `CONTRATO`        VARCHAR(100),
+                `NOME_MUTUÁRIO`   VARCHAR(255),
+                `CPF`             VARCHAR(20)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
 
         insert_sql = f"""
-        INSERT INTO `{DB_TABLE}` (`CONTRATO`, `CPF_MUTUÁRIO`, `CPF_COOBRIGADO`, `Nome_Arquivo`)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO `{DB_TABLE}` (`CONTRATO`, `NOME_MUTUÁRIO`, `CPF`)
+        VALUES (%s, %s, %s)
         """
         rows = [
             (
-                str(r["CONTRATO"]) if pd.notna(r["CONTRATO"]) else "",
-                str(r["CPF_MUTUÁRIO"]) if pd.notna(r["CPF_MUTUÁRIO"]) else "",
-                str(r["CPF_COOBRIGADO"]) if pd.notna(r["CPF_COOBRIGADO"]) else "",
-                str(r["Nome_Arquivo"]) if pd.notna(r["Nome_Arquivo"]) else "",
+                str(r["CONTRATO"])      if pd.notna(r["CONTRATO"])      else "",
+                str(r["NOME_MUTUÁRIO"]) if pd.notna(r["NOME_MUTUÁRIO"]) else "",
+                str(r["CPF"])           if pd.notna(r["CPF"])           else "",
             )
             for _, r in df.iterrows()
         ]
@@ -198,75 +226,81 @@ def import_to_mysql(df: pd.DataFrame):
 
     return conn
 
-# ─── STEP 5: JOIN query ───────────────────────────────────────────────────────
+# ─── STEP 5: JOIN queries ─────────────────────────────────────────────────────
 def run_join_query(conn):
     print(f"\n{'='*60}")
     print("PASSO 5 — Executando JOIN")
     print(f"{'='*60}")
 
-    query = f"""
-    SELECT
+    # Bloco SELECT reutilizado nos 3 queries
+    SELECT_BLOCK = f"""
         rp.alert_id,
         rp.cpf_titular_sem_mascara,
         REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') AS cpf_conjuge,
         rp.nome_titular,
         rp.meta->>'$.data.nome_conjuge' AS nome_conjuge,
         c.CONTRATO,
+        c.`NOME_MUTUÁRIO`,
         o.user_name
+    """
+
+    JOIN_COND = f"""
+        rp.cpf_titular_sem_mascara = c.`CPF` COLLATE utf8mb4_0900_ai_ci
+        OR REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF` COLLATE utf8mb4_0900_ai_ci
+    """
+
+    query_join = f"""
+    SELECT {SELECT_BLOCK}
     FROM tb_resumo_prioridade AS rp
-    LEFT JOIN log_hist_observacoes AS o
-        ON rp.alert_id = o.alert_id
-    INNER JOIN `{DB_TABLE}` AS c
-        ON (
-            rp.cpf_titular_sem_mascara = c.`CPF_MUTUÁRIO` COLLATE utf8mb4_0900_ai_ci
-            OR rp.cpf_titular_sem_mascara = c.`CPF_COOBRIGADO` COLLATE utf8mb4_0900_ai_ci
-            OR REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF_MUTUÁRIO` COLLATE utf8mb4_0900_ai_ci
-            OR REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF_COOBRIGADO` COLLATE utf8mb4_0900_ai_ci
-        )
+    LEFT JOIN log_hist_observacoes AS o ON rp.alert_id = o.alert_id
+    INNER JOIN `{DB_TABLE}` AS c ON ({JOIN_COND})
     WHERE rp.statussuhab = 15
       AND o.new_json->>'$.statussuhab' = '15'
     """
 
     query_faltantes = f"""
-    SELECT
-        c.CONTRATO,
-        c.`CPF_MUTUÁRIO`,
-        c.`CPF_COOBRIGADO`,
-        c.Nome_Arquivo
+    SELECT c.CONTRATO, c.`NOME_MUTUÁRIO`, c.`CPF`
     FROM `{DB_TABLE}` AS c
     WHERE NOT EXISTS (
         SELECT 1
         FROM tb_resumo_prioridade AS rp
         LEFT JOIN log_hist_observacoes AS o ON rp.alert_id = o.alert_id
-        WHERE (
-            rp.cpf_titular_sem_mascara = c.`CPF_MUTUÁRIO` COLLATE utf8mb4_0900_ai_ci
-            OR rp.cpf_titular_sem_mascara = c.`CPF_COOBRIGADO` COLLATE utf8mb4_0900_ai_ci
-            OR REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF_MUTUÁRIO` COLLATE utf8mb4_0900_ai_ci
-            OR REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF_COOBRIGADO` COLLATE utf8mb4_0900_ai_ci
-        )
-        AND rp.statussuhab = 15
-        AND o.new_json->>'$.statussuhab' = '15'
+        WHERE ({JOIN_COND})
+          AND rp.statussuhab = 15
+          AND o.new_json->>'$.statussuhab' = '15'
     )
     """
 
-    try:
-        result_df = pd.read_sql(query, conn)
-        if result_df.empty:
-            print("  [INFO] resultado_join: 0 linhas.")
-        else:
-            output = Path(OUTPUT_JOIN)
-            result_df.to_csv(output, index=False, encoding="utf-8-sig")
-            print(f"  [OK] resultado_join: {len(result_df)} linha(s) — salvo em {output}")
-            print(result_df.to_string(index=False))
+    query_diff15 = f"""
+    SELECT DISTINCT rp.alert_id, rp.statussuhab, {SELECT_BLOCK}
+    FROM tb_resumo_prioridade AS rp
+    LEFT JOIN log_hist_observacoes AS o ON rp.alert_id = o.alert_id
+    INNER JOIN `{DB_TABLE}` AS c
+        ON rp.cpf_titular_sem_mascara = c.`CPF` COLLATE utf8mb4_0900_ai_ci
+    WHERE rp.statussuhab <> 15
+    UNION
+    SELECT DISTINCT rp.alert_id, rp.statussuhab, {SELECT_BLOCK}
+    FROM tb_resumo_prioridade AS rp
+    LEFT JOIN log_hist_observacoes AS o ON rp.alert_id = o.alert_id
+    INNER JOIN `{DB_TABLE}` AS c
+        ON REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF` COLLATE utf8mb4_0900_ai_ci
+    WHERE rp.statussuhab <> 15
+    """
 
-        faltantes_df = pd.read_sql(query_faltantes, conn)
-        if faltantes_df.empty:
-            print("  [INFO] resultado_faltantes_join: 0 linhas.")
-        else:
-            output_f = Path(OUTPUT_FALTANTES)
-            faltantes_df.to_csv(output_f, index=False, encoding="utf-8-sig")
-            print(f"\n  [OK] resultado_faltantes_join: {len(faltantes_df)} linha(s) — salvo em {output_f}")
-            print(faltantes_df.to_string(index=False))
+    tasks = [
+        (query_join,     Path(OUTPUT_JOIN),      "resultado_join"),
+        (query_faltantes, Path(OUTPUT_FALTANTES), "resultado_faltantes_join"),
+        (query_diff15,   Path(OUTPUT_DIFF15),     "resultado_join_statussuhab_diff15"),
+    ]
+
+    try:
+        for query, output, label in tasks:
+            result_df = pd.read_sql(query, conn)
+            if result_df.empty:
+                print(f"  [INFO] {label}: 0 linhas.")
+            else:
+                result_df.to_csv(output, index=False, encoding="utf-8-sig")
+                print(f"  [OK] {label}: {len(result_df)} linha(s) — salvo em {output}")
     except Exception as e:
         print(f"  [ERRO] Falha ao executar a query: {e}")
     finally:
