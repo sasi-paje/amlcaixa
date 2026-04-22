@@ -44,7 +44,8 @@ COL_ALIASES = {
 def load_excels(folder: Path):
     xlsx_files = list(folder.glob("*.xlsx")) + list(folder.glob("**/*.xlsx"))
     xlsx_files = list({str(p): p for p in xlsx_files}.values())
-    xlsx_files = [p for p in xlsx_files if not p.name.startswith("~$")]
+    EXCLUDE = {"RESUMO.xlsx"}
+    xlsx_files = [p for p in xlsx_files if not p.name.startswith("~$") and p.name not in EXCLUDE]
 
     if not xlsx_files:
         print("[ERRO] Nenhum arquivo .xlsx encontrado.")
@@ -262,12 +263,12 @@ def run_join_query(conn):
     SELECT c.CONTRATO, c.`NOME_MUTUÁRIO`, c.`CPF`
     FROM `{DB_TABLE}` AS c
     WHERE NOT EXISTS (
-        SELECT 1
-        FROM tb_resumo_prioridade AS rp
-        LEFT JOIN log_hist_observacoes AS o ON rp.alert_id = o.alert_id
-        WHERE ({JOIN_COND})
-          AND rp.statussuhab = 15
-          AND o.new_json->>'$.statussuhab' = '15'
+        SELECT 1 FROM tb_resumo_prioridade AS rp
+        WHERE rp.cpf_titular_sem_mascara = c.`CPF` COLLATE utf8mb4_0900_ai_ci
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM tb_resumo_prioridade AS rp
+        WHERE REPLACE(REPLACE(rp.meta->>'$.data.cpf_conjuge', '.', ''), '-', '') = c.`CPF` COLLATE utf8mb4_0900_ai_ci
     )
     """
 
@@ -288,14 +289,19 @@ def run_join_query(conn):
     """
 
     tasks = [
-        (query_join,     Path(OUTPUT_JOIN),      "resultado_join"),
-        (query_faltantes, Path(OUTPUT_FALTANTES), "resultado_faltantes_join"),
-        (query_diff15,   Path(OUTPUT_DIFF15),     "resultado_join_statussuhab_diff15"),
+        (query_join,      Path(OUTPUT_JOIN),       "resultado_join",      None, "cpf_titular_sem_mascara"),
+        (query_faltantes, Path(OUTPUT_FALTANTES),  "resultado_faltantes_join", None, None),
+        (query_diff15,    Path(OUTPUT_DIFF15),      "resultado_join_statussuhab_diff15", ["user_name"], None),
     ]
 
     try:
-        for query, output, label in tasks:
+        for query, output, label, drop_cols, dedup_col in tasks:
             result_df = pd.read_sql(query, conn)
+            if drop_cols:
+                result_df = result_df.drop(columns=[c for c in drop_cols if c in result_df.columns])
+                result_df = result_df.drop_duplicates()
+            if dedup_col and dedup_col in result_df.columns:
+                result_df = result_df.drop_duplicates(subset=[dedup_col])
             if result_df.empty:
                 print(f"  [INFO] {label}: 0 linhas.")
             else:
