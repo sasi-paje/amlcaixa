@@ -19,10 +19,14 @@ DB_PASS   = os.getenv("DB_PASS", "")
 DB_SCHEMA = os.getenv("DB_SCHEMA", "suhab_copy")
 DB_TABLE  = "COMPARACAO"
 REQUIRED_COLS = ["CONTRATO", "NOME_MUTUÁRIO", "CPF_MUTUÁRIO", "CPF_COOBRIGADO"]
-OUTPUT_CSV      = "consolidado.csv"
-OUTPUT_JOIN     = "resultado_join.csv"
-OUTPUT_FALTANTES = "resultado_faltantes_join.csv"
-OUTPUT_DIFF15   = "resultado_join_statussuhab_diff15.csv"
+OUTPUT_CSV           = "consolidado.csv"
+OUTPUT_JOIN          = "resultado_join.csv"
+OUTPUT_FALTANTES     = "resultado_faltantes_join.csv"
+OUTPUT_DIFF15        = "resultado_join_statussuhab_diff15.csv"
+OUTPUT_CONTRATO15    = "contrato_assinado_15.csv"
+OUTPUT_PRESENTES     = "presentes_no_consolidado.csv"
+OUTPUT_FALTANTES_CON = "faltantes_no_consolidado.csv"
+OUTPUT_MATCH_GERAL   = "match_geral.csv"
 
 # ─── STEP 0: resolve Excel folder ─────────────────────────────────────────────
 def get_excel_folder():
@@ -312,6 +316,94 @@ def run_join_query(conn):
     finally:
         conn.close()
 
+# ─── STEP 6: extrai contrato_assinado_15 e cruza com consolidado ─────────────
+def run_contrato_assinado(consolidated: pd.DataFrame):
+    print(f"\n{'='*60}")
+    print("PASSO 6 — Extração contrato_assinado_15 e cruzamento")
+    print(f"{'='*60}")
+
+    try:
+        conn = pymysql.connect(
+            host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS,
+            database=DB_SCHEMA, charset="utf8mb4", autocommit=True,
+            connect_timeout=30, read_timeout=300, write_timeout=300,
+        )
+    except Exception as e:
+        print(f"  [ERRO DE CONEXÃO] {e}")
+        return
+
+    query = """
+    SELECT rp.alert_id,
+           UPPER(rp.nome_titular) AS nome_titular,
+           rp.cpf_titular_sem_mascara,
+           rp.data_de_nascimento_titular,
+           rp.statussuhab,
+           sm.status_name
+    FROM suhab_copy.tb_resumo_prioridade AS rp
+    LEFT JOIN suhab_copy.status_menu AS sm ON rp.statussuhab = sm.ids_status
+    WHERE rp.statussuhab = 15
+    """
+
+    try:
+        ca = pd.read_sql(query, conn)
+        ca.to_csv(Path(OUTPUT_CONTRATO15), index=False, encoding="utf-8-sig")
+        print(f"  [OK] {OUTPUT_CONTRATO15}: {len(ca)} linha(s)")
+
+        # Normaliza CPFs
+        ca["cpf_titular_sem_mascara"] = ca["cpf_titular_sem_mascara"].astype(str).str.strip().str.zfill(11)
+        consolidated["CPF"] = consolidated["CPF"].astype(str).str.strip().str.zfill(11)
+        cpfs_consolidado = set(consolidated["CPF"])
+
+        presentes = ca[ca["cpf_titular_sem_mascara"].isin(cpfs_consolidado)]
+        faltantes = ca[~ca["cpf_titular_sem_mascara"].isin(cpfs_consolidado)]
+
+        presentes.to_csv(Path(OUTPUT_PRESENTES), index=False, encoding="utf-8-sig")
+        faltantes.to_csv(Path(OUTPUT_FALTANTES_CON), index=False, encoding="utf-8-sig")
+
+        print(f"  [OK] {OUTPUT_PRESENTES}: {len(presentes)} linha(s)")
+        print(f"  [OK] {OUTPUT_FALTANTES_CON}: {len(faltantes)} linha(s)")
+    except Exception as e:
+        print(f"  [ERRO] {e}")
+    finally:
+        conn.close()
+
+# ─── STEP 7: gera match_geral (união resultado_join + diff15) ─────────────────
+def build_match_geral():
+    print(f"\n{'='*60}")
+    print("PASSO 7 — Gerando match_geral.csv")
+    print(f"{'='*60}")
+
+    COLS = ["alert_id", "cpf_titular_sem_mascara", "nome_titular", "statussuhab", "CONTRATO"]
+
+    path_join  = Path(OUTPUT_JOIN)
+    path_diff15 = Path(OUTPUT_DIFF15)
+
+    if not path_join.exists():
+        print(f"  [AVISO] {OUTPUT_JOIN} não encontrado — pulando.")
+        return
+    if not path_diff15.exists():
+        print(f"  [AVISO] {OUTPUT_DIFF15} não encontrado — pulando.")
+        return
+
+    rj   = pd.read_csv(path_join,   dtype=str)
+    rd15 = pd.read_csv(path_diff15, dtype=str)
+
+    # resultado_join não traz statussuhab na query; adiciona fixo = 15
+    rj["statussuhab"] = "15"
+
+    # seleciona apenas as colunas de interesse (ignora extras como cpf_conjuge etc.)
+    rj_sel   = rj[[c   for c in COLS if c in rj.columns]]
+    rd15_sel = rd15[[c for c in COLS if c in rd15.columns]]
+
+    match_geral = pd.concat([rj_sel, rd15_sel], ignore_index=True)
+    match_geral = match_geral.drop_duplicates(subset=["cpf_titular_sem_mascara"])
+
+    match_geral.to_csv(Path(OUTPUT_MATCH_GERAL), index=False, encoding="utf-8-sig")
+    print(f"  [OK] {OUTPUT_MATCH_GERAL}: {len(match_geral)} linha(s) "
+          f"(status 15: {(match_geral['statussuhab'] == '15').sum()} | "
+          f"outros: {(match_geral['statussuhab'] != '15').sum()})")
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     folder = get_excel_folder()
@@ -321,6 +413,8 @@ if __name__ == "__main__":
     conn = import_to_mysql(consolidated)
     if conn:
         run_join_query(conn)
+    build_match_geral()
+    run_contrato_assinado(consolidated)
 
     print(f"\n{'='*60}")
     print("Pipeline concluído.")
