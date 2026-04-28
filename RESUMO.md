@@ -4,80 +4,82 @@
 
 ## Origem dos dados
 
-O processo de validação cruza duas fontes distintas: os relatórios analíticos enviados pela CAIXA Econômica Federal (arquivos Excel) e o sistema interno de gestão habitacional SUHAB. O objetivo é identificar quais contemplados constam em ambas as bases, quais estão em apenas uma delas e qual é a situação cadastral de cada um.
+O processo cruza duas fontes: os relatórios analíticos enviados pela CAIXA Econômica Federal (9 arquivos Excel) e o sistema interno SUHAB. O objetivo é identificar quais contemplados constam em ambas as bases, quais estão em apenas uma delas e qual é a situação cadastral de cada um.
 
 ---
 
 ## Base consolidada da CAIXA
 
-O arquivo `consolidado.csv` reúne os **2.650 mutuários** extraídos dos relatórios Excel da CAIXA, considerando exclusivamente o CPF do mutuário principal. Registros duplicados por CPF ou por número de contrato foram eliminados, garantindo unicidade.
+O arquivo `consolidado_caixa.csv` reúne **2.979 registros únicos** (par CONTRATO + CPF) extraídos dos 9 relatórios Excel, considerando todas as colunas de CPF disponíveis — `CPF_MUTUÁRIO`, `CPF_BENEFICIÁRIO`, `CPF_COOBRIGADO` e `CPF_COOBRIGADO_2` — expandidas via UNION ALL. CPFs zerados ou em branco foram descartados. O arquivo possui **2.979 CPFs únicos** distribuídos em **2.649 contratos únicos**.
 
 ---
 
 ## Resultado do cruzamento com o SUHAB
 
-Do total de 2.650 mutuários consolidados, **2.625 (99,1%)** foram localizados no sistema SUHAB — resultado registrado no arquivo `match_geral.csv`. Desses:
+O cruzamento compara cada CPF da base CAIXA contra o `cpf_titular_sem_mascara` e o `cpf_conjuge` da tabela `tb_resumo_prioridade`. Resultados:
 
-- **2.591** possuem o contrato efetivamente assinado (status 15 — *Contrato Assinado*), registrados em `resultado_join.csv` e detalhados em `match_status_15.csv`;
-- **35** foram localizados no SUHAB, porém com status diferente de 15, indicando que o processo contratual ainda não foi concluído ou houve alteração posterior. Esses casos constam em `resultado_join_statussuhab_diff15.csv` e são detalhados em `match_status_0.csv` (32 casos), `match_status_11.csv` (2 casos) e `match_status_14.csv` (1 caso);
-- **25** constam nos relatórios da CAIXA mas **não foram localizados no SUHAB**, registrados em `resultado_faltantes_join.csv` e em `not_match-somente-lado-caixa.csv`. Esses casos requerem verificação, pois podem indicar divergência de CPF entre os dois sistemas ou ausência de cadastro no SUHAB.
+- **2.953 CPFs da CAIXA** encontraram correspondência no SUHAB, gerando **3.127 combinações** (um CPF pode casar com mais de um alert_id) e **2.820 alert_ids únicos** — arquivo `consolidado_suhab_caixa_match.csv`.
+- **26 CPFs da CAIXA** não foram localizados no SUHAB — arquivo `consolidado_suhab_caixa_not_match_lado_caixa.csv`.
+- **189 pessoas** com `statussuhab = 15` no SUHAB não possuem CPF correspondente nos relatórios da CAIXA — arquivo `consolidado_suhab_caixa_not_match_lado_suhab.csv`.
 
 ---
 
-## Contemplados no SUHAB sem correspondência nos relatórios da CAIXA
+## Distribuição de status nos registros com match
 
-O arquivo `not_match-somente-lado-suhab.csv` lista **239 pessoas** que possuem contrato assinado confirmado no SUHAB (status 15) mas cujos CPFs **não constam em nenhum dos arquivos Excel** recebidos da CAIXA. Esses casos indicam que a CAIXA ainda não incluiu esses contemplados nas remessas de relatórios enviadas à SUHAB, ou que há divergência no número do CPF registrado em cada sistema.
+| Status | Descrição               | Registros |
+|-------:|-------------------------|----------:|
+| 15     | Contrato Assinado       |   2.885   |
+|  0     | (sem status definido)   |     239   |
+| 11     | —                       |       2   |
+| 14     | —                       |       1   |
+| **Total** |                      | **3.127** |
 
 ---
 
 ## Síntese executiva
 
 ```
-┌────────────────────────────────────────────┬────────────┐
-│                  Situação                  │ Quantidade │
-├────────────────────────────────────────────┼────────────┤
-│ Mutuários consolidados (base CAIXA)        │   2.650    │
-├────────────────────────────────────────────┼────────────┤
-│ Localizados no SUHAB                       │   2.625    │
-├────────────────────────────────────────────┼────────────┤
-│ Com contrato assinado (status 15)          │   2.591    │
-├────────────────────────────────────────────┼────────────┤
-│ Localizados com status diferente de 15     │      35    │
-├────────────────────────────────────────────┼────────────┤
-│ Na CAIXA sem registro no SUHAB             │      25    │
-├────────────────────────────────────────────┼────────────┤
-│ No SUHAB (status 15) sem registro na CAIXA │     239    │
-└────────────────────────────────────────────┴────────────┘
+┌───────────────────────────────────────────────────────────────┬────────────┐
+│                           Situação                            │ Quantidade │
+├───────────────────────────────────────────────────────────────┼────────────┤
+│ Registros consolidados da CAIXA (CONTRATO + CPF únicos)       │   2.979    │
+├───────────────────────────────────────────────────────────────┼────────────┤
+│ CPFs da CAIXA com match no SUHAB                              │   2.953    │
+├───────────────────────────────────────────────────────────────┼────────────┤
+│   → Com status 15 (Contrato Assinado)                         │   2.885    │
+├───────────────────────────────────────────────────────────────┼────────────┤
+│   → Com status diferente de 15                                │     242    │
+├───────────────────────────────────────────────────────────────┼────────────┤
+│ CPFs da CAIXA sem nenhum match no SUHAB                       │      26    │
+├───────────────────────────────────────────────────────────────┼────────────┤
+│ No SUHAB (status 15) sem correspondência na CAIXA             │     189    │
+└───────────────────────────────────────────────────────────────┴────────────┘
 ```
 
 ---
 
-## Visão geral dos arquivos
+## Visão geral dos arquivos gerados
 
 ```
-┌───────────────────────────────────────┬───────────┬─────────────────────────────────────────────────────────────────┐
-│                Arquivo                │ Registros │                            Descrição                            │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ consolidado.csv                       │   2.650   │ Excel CAIXA — só CPF_MUTUÁRIO, sem duplicata de CPF ou CONTRATO │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ resultado_join.csv                    │   2.591   │ Match SUHAB com status = 15                                     │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ resultado_join_statussuhab_diff15.csv │      35   │ Match SUHAB com status ≠ 15                                     │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ resultado_faltantes_join.csv          │      25   │ No Excel, sem match no SUHAB                                    │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ match_geral.csv                       │   2.625   │ União dos dois joins (sem duplicata de CPF ou CONTRATO)         │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ match_status_15.csv                   │   2.590   │ match_geral filtrado status = 15                                │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ match_status_0.csv                    │      32   │ match_geral filtrado status = 0                                 │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ match_status_11.csv                   │       2   │ match_geral filtrado status = 11                                │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ match_status_14.csv                   │       1   │ match_geral filtrado status = 14                                │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ not_match-somente-lado-caixa.csv      │      25   │ No Excel da CAIXA mas sem correspondência no SUHAB              │
-├───────────────────────────────────────┼───────────┼─────────────────────────────────────────────────────────────────┤
-│ not_match-somente-lado-suhab.csv      │     239   │ Status 15 no SUHAB mas CPF ausente nos Excel da CAIXA           │
-└───────────────────────────────────────┴───────────┴─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┬───────────┬──────────────────────────────────────────────────────────────────────────────┐
+│ Arquivo                                                 │ Registros │ Descrição                                                                    │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│ consolidado_caixa.csv                                   │   2.979   │ UNION de CPF_MUTUÁRIO, CPF_BENEFICIÁRIO, CPF_COOBRIGADO, CPF_COOBRIGADO_2    │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│ consolidado_suhab_caixa_match.csv                       │   3.127   │ CPFs da CAIXA com match no SUHAB (por cpf_titular ou cpf_conjuge).           │
+│                                                         │           │ 2.820 alert_ids únicos — 307 linhas duplicadas pois o mesmo alert_id casou   │
+│                                                         │           │ duas vezes quando titular E cônjuge ambos constam na base da CAIXA           │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│   match_status_15.csv                                   │   2.885   │ Derivado do match — statussuhab = 15 (Contrato Assinado)                     │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│   match_status_0.csv                                    │     239   │ Derivado do match — statussuhab = 0                                          │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│   match_status_11.csv                                   │       2   │ Derivado do match — statussuhab = 11                                         │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│   match_status_14.csv                                   │       1   │ Derivado do match — statussuhab = 14                                         │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│ consolidado_suhab_caixa_not_match_lado_caixa.csv        │      26   │ CPFs da CAIXA sem nenhuma correspondência no SUHAB                           │
+├─────────────────────────────────────────────────────────┼───────────┼──────────────────────────────────────────────────────────────────────────────┤
+│ consolidado_suhab_caixa_not_match_lado_suhab.csv        │     189   │ Status 15 no SUHAB cujo CPF não consta em nenhum Excel da CAIXA              │
+└─────────────────────────────────────────────────────────┴───────────┴──────────────────────────────────────────────────────────────────────────────┘
 ```
